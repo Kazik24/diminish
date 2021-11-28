@@ -1,0 +1,16 @@
+[package]
+name = "diminish"
+version = "0.1.0"
+authors = ["Kazik24 <kazik24official@gmail.com>"]
+edition = "2021"
+description = "Library for simple and relatively fast binary object stream compression."
+readme = "README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dev-dependencies]
+rand = "0.8.4"
+rayon = "1.5.1"
+parking_lot = "0.11.2"
