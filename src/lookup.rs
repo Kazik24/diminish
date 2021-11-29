@@ -9,7 +9,7 @@ pub(crate) struct LookupTable<T,const SIZE: usize>{
     head: usize,
     count: usize,
     array: MaybeUninit<[T;SIZE]>,
-    //hashtable: [[usize;2];SIZE], //SIZE is always power of two, so (SIZE*2)-1 is almost 2x larger and a prime
+    //hashtable: [[usize;2];SIZE], //SIZE is always power of two, so (SIZE*2)-1 is almost 2x larger (~0.5 load factor) and a prime
 }
 
 
@@ -63,18 +63,22 @@ impl<T,const SIZE: usize> LookupTable<T,SIZE> {
     //     let array = self.hashtable.as_mut_ptr().cast::<usize>();
     //     unsafe{ from_raw_parts_mut(array,SIZE*2-1) }
     // }
-    pub fn push(&mut self,value: T){
+    pub fn push(&mut self,value: T)->&T{
         //advance head
         self.head = self.head.wrapping_add(1) & (SIZE - 1);
         if self.count == SIZE {
             //drop element at current position and overwrite it with new value
             unsafe{
-                *self.ptr_mut().add(self.head) = value;
+                let ptr = &mut *self.ptr_mut().add(self.head);
+                *ptr = value;
+                ptr
             }
         }else{//if queue is not full yet
             self.count += 1;
             unsafe{ //only write value case we know that memory is uninit at this place
-                self.ptr_mut().add(self.head).write(value);
+                let ptr = self.ptr_mut().add(self.head);
+                ptr.write(value);
+                &*ptr
             }
         }
     }

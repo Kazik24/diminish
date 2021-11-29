@@ -2,6 +2,7 @@ use std::io::*;
 use std::mem::{replace, size_of};
 use std::slice::from_mut;
 use std::convert::TryInto;
+use bitstream_io::{BitRead, Numeric, SignedNumeric};
 
 pub struct BitWriter<'a,W: Write>{
     pub(crate) inner: &'a mut W,
@@ -134,59 +135,12 @@ impl<'a,R: Read> BitReader<'a,R>{
     }
 
 
-    // pub fn read_u128(&mut self)->Result<u128>{
-    //     let mut data = [0;16];
-    //     self.read_exact(&mut data).map(|_|u128::from_be_bytes(data))
-    // }
-    // pub fn read_u64(&mut self)->Result<u64>{
-    //     let mut data = [0;8];
-    //     self.read_exact(&mut data).map(|_|u64::from_be_bytes(data))
-    // }
     def_read_func!(read_u128,u128);
     def_read_func!(read_u64,u64);
     def_read_func!(read_u32,u32,u64);
     def_read_func!(read_u16,u16,u32);
     def_read_func!(read_u8,u8,u16);
-    // pub fn read_u32(&mut self)->Result<u32>{
-    //     const BYTES: usize = size_of::<u32>();
-    //     if self.is_aligned() {
-    //         let mut v = [0;BYTES];
-    //         self.inner.read_exact(&mut v).map(|_|u32::from_be_bytes(v))
-    //     }else{
-    //         let mut v = [0;BYTES*2];
-    //         v[BYTES-1] = self.current;
-    //         self.inner.read_exact(&mut v[BYTES..])?;
-    //         let result = u64::from_be_bytes(v).wrapping_shr(self.length as _) as u32;
-    //         self.current = v[BYTES*2 - 1];
-    //         Ok(result)
-    //     }
-    // }
-    // pub fn read_u16(&mut self)->Result<u16>{
-    //     if self.is_aligned() {
-    //         let mut v = [0;2];
-    //         self.inner.read_exact(&mut v).map(|_|u16::from_be_bytes(v))
-    //     }else{
-    //         let mut v = [0;4];
-    //         v[1] = self.current;
-    //         self.inner.read_exact(&mut v[2..])?;
-    //         let result = u32::from_be_bytes(v).wrapping_shr(self.length as _) as u16;
-    //         self.current = v[3];
-    //         Ok(result)
-    //     }
-    // }
-    // pub fn read_u8(&mut self)->Result<u8>{
-    //     if self.is_aligned() {
-    //         let mut v = 0;
-    //         self.inner.read_exact(from_mut(&mut v)).map(|_|v)
-    //     }else{
-    //         let mut v = [0;2];
-    //         v[0] = self.current;
-    //         self.inner.read_exact(&mut v[1..])?;
-    //         let result = u16::from_be_bytes(v).wrapping_shr(self.length as _) as u8;
-    //         self.current = v[1];
-    //         Ok(result)
-    //     }
-    // }
+
     #[inline]
     pub fn bits_until_align(&self)->usize{ self.length as _ }
     #[inline]
@@ -217,6 +171,33 @@ impl<'a,R: Read> BitReader<'a,R>{
             self.length -= 1;
         }
         Ok(self.current & (1 << self.length) != 0)
+    }
+}
+
+
+impl<'a,R: Read> BitRead for BitReader<'a,R>{
+    fn read_bit(&mut self) -> Result<bool> {
+        todo!()
+    }
+
+    fn read<U>(&mut self, bits: u32) -> Result<U> where U: Numeric {
+        todo!()
+    }
+
+    fn read_signed<S>(&mut self, bits: u32) -> Result<S> where S: SignedNumeric {
+        todo!()
+    }
+
+    fn skip(&mut self, bits: u32) -> Result<()> {
+        todo!()
+    }
+
+    fn byte_aligned(&self) -> bool {
+        todo!()
+    }
+
+    fn byte_align(&mut self) {
+        todo!()
     }
 }
 

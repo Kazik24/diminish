@@ -11,11 +11,12 @@ use std::mem::replace;
 use crate::BitWriter;
 use crate::lookup::{LookupTable, LookupTableVec};
 use std::fmt::Debug;
+use std::borrow::{Cow, Borrow};
 
 
 pub trait Serializable: PartialEq + Hash + Debug{ //todo remove debug
     fn convert_to_bits<W: Write>(&self,write: &mut BitWriter<'_,W>)->Result<()>;
-    fn convert_from_bits<R: Read>(read: &mut BitReader<'_,R>)->Result<Self> where Self: Sized + Clone;
+    fn convert_from_bits<R: Read>(read: &mut BitReader<'_,R>)->Result<Self> where Self: Sized;
 }
 
 impl Serializable for bool{
@@ -66,11 +67,34 @@ impl<W: Write,V: Serializable> Encoder<W,V> {
     pub fn get_ref(&self)->&W{&self.write}
     pub fn get_mut(&mut self)->&mut W{&mut self.write}
     pub fn into_inner(self)->W{self.write}
+
+    pub fn write_from(&mut self,iter: impl IntoIterator<Item=V>)->Result<usize>{
+        let mut count = 0;
+        for elem in iter {
+            self.write_value(elem)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+    pub fn write_chunk_ref(&mut self,value: &V,count: u32)->Result<()> where V: Clone{
+        self.write_value_internal(value,Clone::clone,count)
+    }
+    pub fn write_chunk(&mut self,value: V,count: u32)->Result<()>{
+        self.write_value_internal(value,|v|v,count)
+    }
+    pub fn write_value_ref(&mut self,value: &V)->Result<()> where V: Clone{
+        self.write_value_internal(value,Clone::clone,1)
+    }
     pub fn write_value(&mut self,value: V)->Result<()>{
+        self.write_value_internal(value,|v|v,1)
+    }
+
+    pub fn write_value_internal<T>(&mut self,value: T,clone: impl FnOnce(T)->V,count: u32)->Result<()> where T: Borrow<V>{
+        if count == 0 { return Ok(()); }
         match self.lookup.get(self.last_lookup_index) {
             Some(val) => {
-                if val == &value {
-                    self.run_length += 1;
+                if val == value.borrow() {
+                    self.run_length += count;
                     if self.run_length >= 0b1111_1111_1111_1111_1111 + 0b1_1111_1111_1111 + 0b0011_1111 {
                         self.write_run_length_marker()?;
                     }
@@ -79,38 +103,34 @@ impl<W: Write,V: Serializable> Encoder<W,V> {
                         //write run length marker
                         self.write_run_length_marker()?;
                     }
-                    self.run_length = 0;
+                    self.run_length = count - 1;
                     //perform lookup of index
-                    match self.lookup.lookup_index(&value) {
+                    match self.lookup.lookup_index(value.borrow()) {
                         Some(idx) => {
                             //prefix 0b0
                             self.write.write_all(&[idx as u8])?; // 0b0iiiiiii
                             self.last_lookup_index = idx;
                         }
                         None => {
-                            Self::write_to_stream(&mut self.write,&value);
-                            self.lookup.push(value);
-                            // if self.lookup.len() >= MAX_LOOKUP {
-                            //     self.lookup.pop_back();
-                            // }
-                            // self.lookup.push_front(value);
+                            Self::write_to_stream(&mut self.write,value.borrow());
+                            self.lookup.push(clone(value));
                             self.last_lookup_index = 0;
                         }
                     }
                 }
             }
             None => { //init
-                self.run_length = 0; //not needed cause obj init?
+                self.run_length = count - 1; //not needed cause obj init?
                 self.last_lookup_index = 0;//not needed cause obj init?
-                Self::write_to_stream(&mut self.write,&value)?;
-                self.lookup.push(value);
+                Self::write_to_stream(&mut self.write,value.borrow())?;
+                self.lookup.push(clone(value));
             }
         }
         Ok(())
     }
 
     pub fn flush(&mut self)->Result<()>{
-        if self.run_length != 0 {
+        while self.run_length != 0 {
             self.write_run_length_marker()?;
         }
         Ok(())
@@ -153,14 +173,14 @@ impl<W: Write,V: Serializable> Encoder<W,V> {
 
 }
 
-pub struct Decoder<R: Read,V: Serializable + Clone>{
+pub struct Decoder<R: Read,V: Serializable>{
     read: R,
     run_length: u32,
     last_lookup_index: usize,
     lookup: LookupTable<V,MAX_LOOKUP>,
 }
 
-impl<R: Read,V: Serializable + Clone> Decoder<R,V> {
+impl<R: Read,V: Serializable> Decoder<R,V> {
 
     pub fn new(read: R)->Self{
         Self{
@@ -173,87 +193,82 @@ impl<R: Read,V: Serializable + Clone> Decoder<R,V> {
     pub fn get_ref(&self)->&R{&self.read}
     pub fn get_mut(&mut self)->&mut R{&mut self.read}
     pub fn into_inner(self)->R{self.read}
-    pub fn read_chunk(&mut self)->Result<(V,u32)>{
+
+    fn read_token<'a>(read: &mut R,lookup: &'a mut LookupTable<V,MAX_LOOKUP>,last_lookup_index: &mut usize)->Result<(&'a V,u32)>{
+        let mut byte = 0;
+        read.read_exact(std::slice::from_mut(&mut byte))?;
+        if byte <= 0b0111_1111 {
+            let index = byte as usize;
+            match lookup.get(index) {
+                Some(value) => {
+                    *last_lookup_index = index;
+                    Ok((value,0))
+                }
+                None => {
+                    Err(Error::new(ErrorKind::InvalidData,"Lookup index is out of bounds for current table size."))
+                }
+            }
+        }else if byte <= 0b1011_1111 {
+            if lookup.is_empty() {
+                return Err(Error::new(ErrorKind::InvalidData,"Cannot reference value from empty lookup table."))
+            }
+            let update_run = (byte & 0x3f) as _;
+            Ok((lookup.get(*last_lookup_index).unwrap(),update_run))
+        }else if byte <= 0b1101_1111 {
+            if lookup.is_empty() {
+                return Err(Error::new(ErrorKind::InvalidData,"Cannot reference value from empty lookup table."))
+            }
+            let mut update_run = ((byte & 0x1f) as u32) << 8;
+            let mut byte = 0;
+            read.read_exact(std::slice::from_mut(&mut byte))?;
+            update_run |= byte as u32;
+            update_run += 0b0011_1111;
+            Ok((lookup.get(*last_lookup_index).unwrap(),update_run))
+        }else if byte <= 0b1110_1111 {
+            if lookup.is_empty() {
+                return Err(Error::new(ErrorKind::InvalidData,"Cannot reference value from empty lookup table."))
+            }
+            let mut update_run = ((byte & 0xf) as u32) << 16;
+            let mut lower_val = [0;2];
+            read.read_exact(&mut lower_val)?;
+            update_run |= u16::from_be_bytes(lower_val) as u32;
+            update_run += 0b1_1111_1111_1111 + 0b0011_1111;
+            Ok((lookup.get(*last_lookup_index).unwrap(),update_run))
+        }else{
+            let mut read = BitReader{
+                inner: read,
+                current: byte,
+                length: 4,
+            };
+            let value = V::convert_from_bits(&mut read)?;
+            *last_lookup_index = 0; //always valid after this operation
+            let value = lookup.push(value);
+            Ok((value,0))
+        }
+    }
+
+    pub fn read_chunk(&mut self)->Result<(&V,u32)>{
         if self.run_length != 0 {
             let len = self.run_length;
             self.run_length = 0;
-            return Ok((self.lookup.get(self.last_lookup_index).unwrap().clone(),len)); //todo error instead of panic
+            return Ok((self.lookup.get(self.last_lookup_index).unwrap(),len)); //todo error instead of panic
         }
-        let (val,rl) = self.read_token()?;
+        let (val,rl) = Self::read_token(&mut self.read,&mut self.lookup,&mut self.last_lookup_index)?;
         self.run_length = rl;
         if rl == 0 { Ok((val,1)) }
         else { Ok((val,rl)) }
     }
-
-
-    fn read_token(&mut self)->Result<(V,u32)>{
-        let mut byte = 0;
-        self.read.read_exact(std::slice::from_mut(&mut byte))?;
-        match byte {
-            0..=0b0111_1111 => {
-                let index = byte as usize;
-                match self.lookup.get(index) {
-                    Some(value) => {
-                        self.last_lookup_index = index;
-                        Ok((value.clone(),0))
-                    }
-                    None => {
-                        Err(Error::new(ErrorKind::InvalidData,"Lookup index is out of bounds for current table size."))
-                    }
-                }
-            }
-            0b1000_0000..=0b1011_1111 => {
-                if self.lookup.is_empty() {
-                    return Err(Error::new(ErrorKind::InvalidData,"Cannot reference value from empty lookup table."))
-                }
-                let update_run = (byte & 0x3f) as _;
-                Ok((self.lookup.get(self.last_lookup_index).unwrap().clone(),update_run))
-            }
-            0b1100_0000..=0b1101_1111 => {
-                if self.lookup.is_empty() {
-                    return Err(Error::new(ErrorKind::InvalidData,"Cannot reference value from empty lookup table."))
-                }
-                let mut update_run = ((byte & 0x1f) as u32) << 8;
-                let mut byte = 0;
-                self.read.read_exact(std::slice::from_mut(&mut byte))?;
-                update_run |= byte as u32;
-                update_run += 0b0011_1111;
-                Ok((self.lookup.get(self.last_lookup_index).unwrap().clone(),update_run))
-            }
-            0b1110_0000..=0b1110_1111 => {
-                if self.lookup.is_empty() {
-                    return Err(Error::new(ErrorKind::InvalidData,"Cannot reference value from empty lookup table."))
-                }
-                let mut update_run = ((byte & 0xf) as u32) << 16;
-                let mut byte = 0;
-                self.read.read_exact(std::slice::from_mut(&mut byte))?;
-                update_run |= (byte as u32) << 8;
-                self.read.read_exact(std::slice::from_mut(&mut byte))?;
-                update_run |= byte as u32;
-                update_run += 0b1_1111_1111_1111 + 0b0011_1111;
-                Ok((self.lookup.get(self.last_lookup_index).unwrap().clone(),update_run))
-            }
-            0b1111_0000..=0b1111_1111 => {
-                let mut read = BitReader{
-                    inner: &mut self.read,
-                    current: byte,
-                    length: 4,
-                };
-                let value = V::convert_from_bits(&mut read)?;
-                self.last_lookup_index = 0; //always valid after this operation
-                self.lookup.push(value.clone());
-                Ok((value,0))
-            }
-        }
-    }
-    pub fn read_value(&mut self)->Result<V>{
+    pub fn read_value_ref(&mut self)->Result<&V>{
         if self.run_length != 0 {
             self.run_length -= 1;
-            return Ok(self.lookup.get(self.last_lookup_index).unwrap().clone()); //todo error instead of panic
+            return Ok(self.lookup.get(self.last_lookup_index).unwrap()); //todo error instead of panic
         }
-        let (val,rl) = self.read_token()?;
+        let (val,rl) = Self::read_token(&mut self.read,&mut self.lookup,&mut self.last_lookup_index)?;
         self.run_length = rl;
         Ok(val)
+    }
+    pub fn read_value(&mut self)->Result<V> where V: Clone{
+        self.read_value_ref().map(Clone::clone)
     }
 }
 
@@ -337,45 +352,38 @@ mod tests {
     }
     #[test]
     fn test_basic_write() {
+        fn test_case<T: PartialEq + Debug + Serializable + Clone>(data: impl IntoIterator<Item=T>,expect: Vec<u8>){
+            let mut write = Encoder::new(Vec::new());
+            let vec = data.into_iter().collect::<Vec<_>>();
+            let len = vec.len();
+            assert_eq!(write.write_from(vec).unwrap(),len);
+            assert!(write.flush().is_ok());
+            assert_eq!(write.into_inner(),expect);
+        }
 
-        let mut write = Encoder::new(Vec::new());
-
-        write.write_value(1);
-        write.write_value(1);
-        write.write_value(2);
-        write.write_value(1);
-        write.write_value(3);
-        write.write_value(1);
-        write.write_value(4);
-        write.write_value(4);
-        write.write_value(1);
-        write.write_value(1);
-        write.write_value(1);
-        write.flush();
-
-        // println!("********** Size: {}",write.get_ref().len());
-        // for b in write.get_ref() {
-        //     println!("{:08b}",b);
-        // }
-        assert_eq!(write.into_inner(),
-                   vec![240, 0, 0, 0, 16, 128, 240, 0, 0, 0, 32, 1, 240, 0, 0, 0, 48, 2, 240, 0, 0, 0, 64, 128, 3, 129])
-
+        test_case([1i32,1,2,1,3,1,4,4,1,1,1],
+                  vec![240, 0, 0, 0, 16, 128, 240, 0, 0, 0, 32, 1, 240, 0, 0, 0, 48, 2, 240, 0, 0, 0, 64, 128, 3, 129])
 
     }
 
     #[test]
     fn test_basic_read() {
+        fn test_case<T: PartialEq + Debug + Serializable + Clone>(data: Vec<u8>,expect: Vec<T>){
+            let expect_read = data.len();
+            let mut read = Decoder::new(Cursor::new(data));
 
-        let data = vec![240,23,222,111,212,000,1,2,4,79,0,0];
-        let mut read = Decoder::new(Cursor::new(data));
-
-        let mut result: Vec<i32> = Vec::new();
-        while let Ok(v) = read.read_value() {
-            result.push(v);
+            let mut result: Vec<T> = Vec::new();
+            for _ in 0..expect.len() {
+                result.push(read.read_value().unwrap());
+            }
+            assert_eq!(read.get_ref().position(),expect_read as u64);
+            assert_eq!(read.read_value().unwrap_err().kind(),ErrorKind::UnexpectedEof);
+            assert_eq!(result,expect);
         }
 
-        println!("{:?}",result);
 
+        test_case(vec![240, 0, 0, 0, 16, 128, 240, 0, 0, 0, 32, 1, 240, 0, 0, 0, 48, 2, 240, 0, 0, 0, 64, 128, 3, 129],
+                  vec![1i32,1,2,1,3,1,4,4,1,1,1]);
 
     }
     #[test]
@@ -392,15 +400,14 @@ mod tests {
             while let Ok(val) = read.read_value() {}
         }
     }
-    #[test]
+    //#[test]
     fn test_read_any_data_no_panic(){
-        // let it: rayon::range_inclusive::Iter<u32> = (0..=u32::MAX).into_par_iter();
-        // it.for_each(|v|{
-        //     let array = v.to_be_bytes();
-        //     let mut read = Decoder::<_,u8>::new(Cursor::new(array));
-        //
-        //     read.read_value();
-        // });
+        let it: rayon::range_inclusive::Iter<u32> = (0..=u32::MAX).into_par_iter();
+        it.for_each(|v|{
+            let mut read = Decoder::<_,u8>::new(Cursor::new(v.to_be_bytes()));
+
+            read.read_chunk();
+        });
 
 
         // for v in 0..=u32::MAX {
